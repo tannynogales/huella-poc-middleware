@@ -1,67 +1,76 @@
 const express = require('express');
 const WebSocket = require('ws');
 const { UareU, CONSTANTS } = require('uareu-node');
+const uareu = UareU.getInstance();
 
 const app = express();
-const port = 4000;
-const wss = new WebSocket.Server({ port: 4001 });
+const PORT = 4000;
+const WSPORT = 4001;
+let readerHandle;
 
-let uareu = UareU.getInstance();
-let reader;
+app.use(express.static('public'));
+app.listen(PORT, () => console.log(`[SERVER] REST API en http://localhost:${PORT}`));
+
+const wss = new WebSocket.Server({ port: WSPORT }, () =>
+  console.log(`[SERVER] WebSocket en ws://localhost:${WSPORT}`)
+);
 
 async function initReader() {
-  try {
-    console.log('Cargando librerías...');
-    await uareu.loadLibs('bin/dpfpdd.dll', 'bin/dpfj.dll');
-    console.log('Librerías cargadas');
+  console.log('[INIT] Cargando librerías...');
+  await uareu.loadLibs();
+  await uareu.dpfpddInit();
 
-    await uareu.dpfpddInit();
-    console.log('SDK inicializado');
+  const devices = await uareu.dpfpddQueryDevices();
+  if (!devices.devicesList.length) throw new Error('No se encontraron dispositivos');
 
-    const { devicesList } = await uareu.dpfpddQueryDevices();
-    if (!devicesList.length) throw new Error('No se encontraron lectores conectados');
-
-    reader = await uareu.dpfpddOpen(devicesList[0]);
-    console.log('Lector abierto:', devicesList[0]);
-  } catch (err) {
-    console.error('Error al inicializar lector:', err.message);
-  }
+  console.log(`[INIT] Dispositivo encontrado: ${devices.devicesList[0].name}`);
+  const opened = await uareu.dpfpddOpen(devices.devicesList[0]);
+  if (!opened) throw new Error('No se pudo abrir el lector');
+  readerHandle = opened;
+  console.log('[INIT] Lector abierto correctamente');
 }
 
-initReader();
-
-app.get('/status', (_, res) => res.send(reader ? 'Lector listo' : 'Lector no inicializado'));
-
-wss.on('connection', ws => {
-  console.log('Cliente WS conectado');
-
-  const capture = () => {
+async function captureFingerprint(ws) {
+  console.log('[CAPTURE] Iniciando captura...');
+  try {
     uareu.dpfpddCaptureAsync(
-      reader,
-      CONSTANTS.DPFPDD_IMAGE_FMT.DPFPDD_IMG_FMT_PNG,
+      readerHandle,
+      CONSTANTS.DPFPDD_IMAGE_FMT.DPFPDD_IMG_FMT_ANSI381,
       CONSTANTS.DPFPDD_IMAGE_PROC.DPFPDD_IMG_PROC_DEFAULT,
-      (err, data) => {
-        if (err) {
-          console.error('Error al capturar huella:', err.message);
-          ws.send(JSON.stringify({ event: 'error', message: err.message }));
+      async (result, resultSize) => {
+        if (!result || !result.imageData) {
+          console.error('[CAPTURE] Error: resultado inválido');
+          ws.send(JSON.stringify({ event: 'error', message: 'Error al capturar huella' }));
           return;
         }
 
-        console.log('Huella capturada, enviando...');
-        ws.send(JSON.stringify({
-          event: 'finger-captured',
-          data: data.toString('base64')
-        }));
+        // Convertir buffer a base64
+        const rawBuffer = Buffer.from(result.data['ref.buffer']);
+        const base64Image = rawBuffer.toString('base64');
+        console.log('[CAPTURE] Captura exitosa. Enviando datos al cliente...');
 
-        capture(); // Captura continua
+        ws.send(JSON.stringify({ event: 'fingerprint', data: base64Image }));
       }
     );
-  };
+  } catch (err) {
+    console.error('[CAPTURE] Error en captura:', err);
+    ws.send(JSON.stringify({ event: 'error', message: 'Error en captura' }));
+  }
+}
 
-  capture();
+wss.on('connection', (ws) => {
+  console.log('[WS] Cliente WebSocket conectado');
+
+  ws.on('message', (message) => {
+    console.log('[WS] Mensaje recibido:', message.toString());
+    const { command } = JSON.parse(message);
+
+    if (command === 'capture') {
+      captureFingerprint(ws);
+    }
+  });
+
+  ws.on('close', () => console.log('[WS] Cliente WebSocket desconectado'));
 });
 
-app.listen(port, () => {
-  console.log(`REST API en http://localhost:${port}`);
-  console.log(`WebSocket en ws://localhost:${port + 1}`);
-});
+initReader().catch((err) => console.error('[INIT] Error durante inicialización:', err));
